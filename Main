@@ -1,0 +1,157 @@
+//Добавляем необходимые библиотеки
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <future>
+#include <memory>
+#include <functional>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
+#include <algorithm>
+
+//Класс - пул потоков
+class ThreadPool {
+public:
+    //Конструктор пула потоков. Создаёт нужное количество потоков,
+    ThreadPool(size_t numThreads) : stop(false) {
+        for (size_t i = 0; i < numThreads; ++i) {
+            threads.emplace_back([this] {
+                //Лямбда-фукция, исполняемая каждым потребителем в пуле потоков
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queueMutex);
+                        //Потоки ожидают задание либо команды на остановку
+                        condition.wait(lock, [this] { return stop || !tasks.empty(); });
+                        if (stop && tasks.empty()) {
+                            return;
+                        }
+                        //Ярлык к заданию и удаление его из очереди
+                        task = std::move(tasks.front());
+                        tasks.pop_front();
+                    }
+                    //Выполнение задания
+                    task();
+                }
+            });
+        }
+    }
+
+    //Добавление задания в пул потоков
+    template <class F, class... Args>
+    auto push_task(F&& f, Args&&... args) -> std::future<typename std::result_of<F(Args...)>::type> {
+        using ReturnType = typename std::result_of<F(Args...)>::type;
+        //Создание packaged task из функции f и ее аргументов
+        auto task = std::make_shared<std::packaged_task<ReturnType()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+        //Получение future для возврата результата выполнения задания
+        std::future<ReturnType> result = task->get_future();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            //Добавление задания в очередь
+            tasks.emplace_back([task]() { (*task)(); });
+        }
+        //Оповещение о новом задании
+        condition.notify_one();
+        return result;
+    }
+
+    //Деструктор пула потоков. Все потоки останавливаются после выполнения своих заданий.
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread& thread : threads) {
+            thread.join();
+        }
+    }
+
+private:
+    std::vector<std::thread> threads; // Вектор для хранения потоков
+    std::deque<std::function<void()>> tasks; // Двунаправленная очередь для хранения заданий
+    std::mutex queueMutex; // Мьютекс для ограничения доступа к заданиям
+    std::condition_variable condition; // Условная переменная для контроля потоков
+    bool stop; // Флаг для остановки потоков
+};
+
+const int cutoff = 100000; 
+
+ThreadPool pool(std::thread::hardware_concurrency()); 
+
+//Функция быстрой сортировки
+template <typename T>
+void quicksort(std::vector<T>& array, size_t left, size_t right) {
+    // Проверка условий для завершения рекурсии
+    if (left >= right) {
+        return;
+    }
+
+    //Выбор значений для опорного элемента
+    size_t pivotIndex = (left + right) / 2;
+    T pivotValue = array[pivotIndex];
+
+    size_t i = left;
+    size_t j = right;
+
+    // Базовая операция быстрой сортировки
+    while (i <= j) {
+        while (array[i] < pivotValue) {
+            ++i;
+        }
+
+        while (array[j] > pivotValue) {
+            --j;
+        }
+
+        if (i <= j) {
+            std::swap(array[i], array[j]);
+            ++i;
+            --j;
+        }
+    }
+    
+    // Выполнение сортировки для участков массива больше и меньше опорного элемента
+    if (j - left > 0 && j - left <= cutoff) {
+        quicksort(array, left, j);
+    } else if (j - left > 0) {
+        // Если размер участка больше cutoff, начинаем выполнение сортировки в отдельном потоке
+        pool.push_task(quicksort<T>, std::ref(array), left, j);
+    }
+
+    if (right - i > 0 && right - i <= cutoff) {
+        quicksort(array, i, right);
+    } else if (right - i > 0) {
+        // Если размер участка больше cutoff, начинаем выполнение сортировки в отдельном потоке
+        pool.push_task(quicksort<T>, std::ref(array), i, right);
+    }
+}
+
+int main() {
+    // Создание исходного массива
+    std::vector<int> array = {7, 2, 1, 6, 8, 5, 3, 4};
+
+    // Вывод исходного массива
+    std::cout << "Original array: ";
+    for (int num : array) {
+        std::cout << num << " ";
+    }
+    std::cout << std::endl;
+
+    // Отправка задания на сортировку в пул потоков
+    pool.push_task(quicksort<int>, std::ref(array), 0, array.size() - 1);
+
+    std::this_thread::sleep_for(std::chrono::seconds(1));  // Ожидание завершения сортировки
+
+    // Вывод отсортированного массива
+    std::cout << "Sorted array: ";
+    for (int num : array) {
+        std::cout << num << " ";
+    }
+    std::cout << std::endl;
+
+    return 0;
+}
